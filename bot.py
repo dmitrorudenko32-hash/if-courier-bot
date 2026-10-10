@@ -9,17 +9,20 @@ import re
 import secrets
 import sqlite3
 import time
+import uuid
+import psycopg
+from psycopg.rows import dict_row
 from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.4-corpuses'
+VERSION = '1.5-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -30,6 +33,9 @@ last_request = 0.0
 session = None
 cache = None
 choices = {}
+drafts = {}
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+menu = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="➕ Додати під’їзд / корпус")],[KeyboardButton(text="📒 Мої позначки"),KeyboardButton(text="Скасувати")]],resize_keyboard=True)
 allowed = {int(x) for x in os.getenv('ALLOWED_USER_IDS', '').split(',') if x.strip()}
 dp = Dispatcher()
 
@@ -343,11 +349,202 @@ async def deliver(message, item, selected):
     await message.answer_photo(BufferedInputFile(picture, filename='building.png'), caption='Схема будинку з даних OpenStreetMap. Номери під’їздів показані лише там, де внесені в карту.')
 
 
+def address_key(text):
+    text=text.casefold().replace('’', "'").replace('ʼ', "'")
+    text=re.sub(r'\b(?:вулиця|вул\.?|івано-франківськ|україна)\b','',text)
+    return re.sub(r'[\s,.;]+','',text)
+
+
+def database(action, owner, payload=None):
+    if not DATABASE_URL:
+        raise ValueError('Для власних позначок додай DATABASE_URL у Render. Збереження поки не підключене.')
+    # Separate table; direct Postgres only. No Telegram/customer data sent to OSM.
+    with psycopg.connect(DATABASE_URL,connect_timeout=10,sslmode='require',prepare_threshold=None,row_factory=dict_row) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS courier_personal_v1 (
+            id UUID PRIMARY KEY, owner BIGINT NOT NULL, address_key TEXT NOT NULL,
+            address_text TEXT NOT NULL, entrance TEXT NOT NULL DEFAULT '',
+            flats TEXT NOT NULL DEFAULT '', lat DOUBLE PRECISION NOT NULL,
+            lon DOUBLE PRECISION NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(owner,address_key,entrance))""")
+        # Keep table inaccessible through Supabase's public REST roles.
+        conn.execute('ALTER TABLE courier_personal_v1 ENABLE ROW LEVEL SECURITY')
+        if action=='save':
+            d=payload
+            conn.execute("""INSERT INTO courier_personal_v1
+              (id,owner,address_key,address_text,entrance,flats,lat,lon)
+              VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+              ON CONFLICT(owner,address_key,entrance) DO UPDATE SET
+              address_text=EXCLUDED.address_text,flats=EXCLUDED.flats,
+              lat=EXCLUDED.lat,lon=EXCLUDED.lon,updated_at=now()""",
+              (uuid.uuid4(),owner,address_key(d['address']),d['address'],d.get('entrance') or '',d.get('flats',''),d['lat'],d['lon']))
+            return []
+        if action=='find':
+            return conn.execute('SELECT * FROM courier_personal_v1 WHERE owner=%s AND address_key=%s ORDER BY entrance',(owner,address_key(payload))).fetchall()
+        if action=='list':
+            return conn.execute('SELECT * FROM courier_personal_v1 WHERE owner=%s ORDER BY updated_at DESC LIMIT 50',(owner,)).fetchall()
+        if action=='delete':
+            return conn.execute('DELETE FROM courier_personal_v1 WHERE owner=%s AND id=%s RETURNING id',(owner,uuid.UUID(payload))).fetchall()
+        return []
+
+
+async def db(action,owner,payload=None):
+    try:
+        return await asyncio.to_thread(database,action,owner,payload)
+    except ValueError:
+        raise
+    except Exception as exc:
+        logging.error('Personal storage error: %s',type(exc).__name__)
+        raise ValueError('База позначок недоступна. Перевір DATABASE_URL у Render або спробуй пізніше. Дані не збережено.') from None
+
+
+def draft_for(message):
+    key=(message.chat.id,message.from_user.id)
+    d=drafts.get(key)
+    if d and d['expires']<time.time():
+        drafts.pop(key,None);return None
+    return d
+
+
+@dp.message(Command('cancel'))
+@dp.message(F.text=='Скасувати')
+async def cancel(message):
+    if not permitted(message):return
+    drafts.pop((message.chat.id,message.from_user.id),None)
+    await message.answer('Додавання скасовано. Можеш шукати адресу.',reply_markup=menu)
+
+
+@dp.message(Command('add'))
+@dp.message(F.text=='➕ Додати під’їзд / корпус')
+async def add(message):
+    if not permitted(message):return
+    if message.chat.type!='private':
+        await message.answer('Додавай власні позначки в особистому чаті з ботом.');return
+    if not DATABASE_URL:
+        await message.answer('Спочатку додай DATABASE_URL у налаштування Render — це постійна база для твоїх позначок.');return
+    drafts[(message.chat.id,message.from_user.id)]={'stage':'address','expires':time.time()+1800,'nonce':secrets.token_hex(6)}
+    await message.answer('Напиши адресу з номером під’їзду або корпусу:\nПулюя 15, під’їзд 1\nВисочана 18, корпус 30\n\nЗбереження позначки замінить твою попередню точку для тієї самої адреси й під’їзду. Скасувати: /cancel',reply_markup=menu)
+
+
+@dp.message(F.location)
+async def saved_location(message):
+    if not permitted(message):return
+    d=draft_for(message)
+    if not d or d['stage']!='location':
+        await message.answer('Щоб зберегти точку, спочатку натисни «Додати під’їзд / корпус».');return
+    loc=message.location
+    if loc.live_period:
+        await message.answer('Надішли звичайну точку, а не трансляцію геопозиції.');return
+    if not (48.85<=loc.latitude<=49.00 and 24.62<=loc.longitude<=24.80):
+        await message.answer('Точка поза Івано-Франківськом і найближчими околицями. Перевір її.');return
+    d.update(lat=loc.latitude,lon=loc.longitude,stage='flats')
+    await message.answer('Напиши діапазон квартир, наприклад 1–37. Якщо він невідомий або додаєш корпус — надішли «-».')
+
+
+async def process_draft(message,d):
+    if d['stage']=='address':
+        try:
+            text,entrance,house=parse_address(message.text)
+        except ValueError as exc:
+            await message.answer(str(exc));return
+        if not entrance and not re.search(r'к\d',house):
+            await message.answer('Укажи під’їзд або корпус, наприклад: Пулюя 15, під’їзд 1.');return
+        d.update(address=text,entrance=entrance,stage='location')
+        await message.answer('Надішли точну точку входу або корпусу: 📎 → Геопозиція → вибери місце на карті. Поточну геопозицію надсилай лише якщо стоїш біля потрібного входу.');return
+    if d['stage']=='location':
+        await message.answer('Очікую точку через 📎 → Геопозиція. Скасувати: /cancel');return
+    if d['stage']=='flats':
+        value=message.text.strip()
+        if value!='-' and not re.fullmatch(r'\d+(?:\s*[-–—]\s*\d+)?',value):
+            await message.answer('Укажи номер або діапазон квартир, наприклад 1–37, або «-».');return
+        if '-' in value.replace('–','-').replace('—','-') and value!='-':
+            a,z=map(int,re.split(r'[-–—]',value));
+            if a>z:
+                await message.answer('Початок діапазону має бути не більшим за кінець.');return
+        d.update(flats='' if value=='-' else value,stage='confirm')
+        label=d['address']+(f", під’їзд {d['entrance']}" if d['entrance'] else '')
+        await message.answer_location(latitude=d['lat'],longitude=d['lon'])
+        await message.answer(f"Зберегти?\n{label}\nКвартири: {d['flats'] or 'не вказані'}\n{d['lat']:.7f}, {d['lon']:.7f}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Зберегти',callback_data='save:'+d['nonce'])]]));return
+    await message.answer('Натисни «Зберегти» під перевіреною точкою або /cancel.')
+
+
+@dp.callback_query(F.data.startswith('save:'))
+async def save_point(callback):
+    if not permitted(callback):await callback.answer();return
+    key=(callback.message.chat.id,callback.from_user.id);d=drafts.get(key)
+    if not d or d['stage']!='confirm' or d['nonce']!=callback.data.split(':')[1] or d['expires']<time.time():
+        await callback.answer('Цей запис застарів. Почни /add знову.',show_alert=True);return
+    await callback.answer('Зберігаю…')
+    try:
+        await db('save',callback.from_user.id,d)
+    except ValueError as exc:
+        await callback.message.answer(str(exc));return
+    drafts.pop(key,None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer('✅ Позначку збережено. Під час пошуку цієї адреси покажу твою точку. Перегляд і видалення: /mine',reply_markup=menu)
+
+
+@dp.message(Command('mine'))
+@dp.message(F.text=='📒 Мої позначки')
+async def mine(message):
+    if not permitted(message):return
+    try:rows=await db('list',message.from_user.id)
+    except ValueError as exc:await message.answer(str(exc));return
+    if not rows:await message.answer('У тебе ще немає позначок. Додати: /add');return
+    await message.answer('Твої останні 50 позначок. Видалення потребує підтвердження.')
+    for r in rows:
+        label=r['address_text']+(f", під’їзд {r['entrance']}" if r['entrance'] else '')
+        await message.answer(label+(f"\nКвартири: {r['flats']}" if r['flats'] else ''),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🗺 Точка',url=f"https://www.openstreetmap.org/?mlat={r['lat']}&mlon={r['lon']}#map=19/{r['lat']}/{r['lon']}"),InlineKeyboardButton(text='Видалити',callback_data='delask:'+str(r['id']))]]))
+
+
+@dp.callback_query(F.data.startswith('delask:'))
+async def delete_ask(callback):
+    if not permitted(callback):await callback.answer();return
+    await callback.answer()
+    await callback.message.answer('Видалити цю позначку?',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Так, видалити',callback_data='delete:'+callback.data.split(':')[1])]]))
+
+
+@dp.callback_query(F.data.startswith('delete:'))
+async def delete_point(callback):
+    if not permitted(callback):await callback.answer();return
+    await callback.answer()
+    try:rows=await db('delete',callback.from_user.id,callback.data.split(':')[1])
+    except ValueError as exc:await callback.message.answer(str(exc));return
+    await callback.message.edit_text('Позначку видалено.' if rows else 'Позначка вже видалена або не належить тобі.')
+
+
+async def deliver_personal(message,rows,entrance):
+    matches=[r for r in rows if (r['entrance'] or None)==entrance]
+    if entrance and not matches:
+        return False  # Other saved entrances cannot substitute the requested one.
+    if not entrance and len(rows)>1:
+        token=secrets.token_hex(6)
+        choices[token]=(message.from_user.id,time.time()+600,[{'_personal_row':r} for r in rows],None)
+        keyboard=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r['address_text']+(f" • під’їзд {r['entrance']}" if r['entrance'] else ' • корпус'),callback_data=f'pick:{token}:{i}')] for i,r in enumerate(rows[:20])])
+        await message.answer('Є твої збережені точки. Обери потрібну:',reply_markup=keyboard);return True
+    r=(matches or rows)[0]
+    lat,lon=r['lat'],r['lon']
+    await message.answer('📌 Твоя позначка: '+r['address_text']+(f", під’їзд {r['entrance']}" if r['entrance'] else '')+(f"\nКвартири: {r['flats']}" if r['flats'] else '')+f"\n{lat:.7f}, {lon:.7f}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🗺 OpenStreetMap',url=f'https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=19/{lat}/{lon}'),InlineKeyboardButton(text='🧭 Маршрут',url=f'https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=walking')]]))
+    await message.answer_location(latitude=lat,longitude=lon)
+    # Only geographic coordinates are sent to OSM; private notes stay in database.
+    try:
+        bbox=f'{lon-0.0021},{lat-0.0014},{lon+0.0021},{lat+0.0014}'
+        result=await fetch_json('https://www.openstreetmap.org/api/0.6/map.json',params={'bbox':bbox},ttl=86400)
+        item={'lat':str(lat),'lon':str(lon),'osm_type':'custom','osm_id':0}
+        elements,target,_=unpack_osm(item,result)
+        mark={'type':'node','id':-1,'lat':lat,'lon':lon,'tags':{'ref':r['entrance'] or 'Точка','addr:flats':r['flats']}}
+        picture=await asyncio.to_thread(draw_map,item,elements,target,[mark],mark['tags']['ref'])
+        await message.answer_photo(BufferedInputFile(picture,filename='personal.png'),caption='Червона точка — твоя позначка. Підкладка: © OpenStreetMap contributors.')
+    except (aiohttp.ClientError,asyncio.TimeoutError,ValueError):
+        await message.answer('Карта-зображення зараз недоступна; твоя точка збережена й доступна за посиланням.')
+    return True
+
+
 @dp.message(CommandStart())
 async def start(message):
     if not permitted(message):
         return
-    await message.answer('Версія '+VERSION+'\nПривіт! Напиши адресу в Івано-Франківську:\nМазепи 42\nМазепи 42, під’їзд 3\nВисочана 18, корпус 2\nВисочана 18 к2, під’їзд 1\n\nЯ надішлю координати, карту й позначені входи. Невідомі під’їзди не вгадую.\nТвій Telegram ID: '+str(message.from_user.id))
+    drafts.pop((message.chat.id,message.from_user.id),None)
+    await message.answer('Версія '+VERSION+'\nПривіт! Напиши адресу в Івано-Франківську:\nМазепи 42\nМазепи 42, під’їзд 3\nВисочана 18, корпус 2\nВисочана 18 к2, під’їзд 1\n\nЯ надішлю координати, карту й позначені входи. Невідомі під’їзди не вгадую.\nТвій Telegram ID: '+str(message.from_user.id)+'\nДодати свою точку: /add\nМої позначки: /mine',reply_markup=menu)
 
 
 @dp.message(Command('version'))
@@ -360,8 +557,17 @@ async def version(message):
 async def address(message):
     if not permitted(message):
         return
+    d=draft_for(message)
+    if d:
+        await process_draft(message,d);return
     try:
         text, entrance, house = parse_address(message.text)
+        if DATABASE_URL:
+            try:
+                personal=await db('find',message.from_user.id,text)
+                if personal and await deliver_personal(message,personal,entrance):return
+            except ValueError as exc:
+                await message.answer(str(exc)+' Продовжую пошук у OSM.')
         status = await message.answer('🔎 Шукаю будинок…')
         rows = await search(text, house)
         if not rows:
@@ -397,7 +603,11 @@ async def pick(callback):
         await callback.answer('Вибір застарів. Надішли адресу ще раз.',show_alert=True); return
     await callback.answer('Готую карту…')
     try:
-        await deliver(callback.message,record[2][int(index)],record[3])
+        item=record[2][int(index)]
+        if '_personal_row' in item:
+            await deliver_personal(callback.message,[item['_personal_row']],item['_personal_row']['entrance'] or None)
+        else:
+            await deliver(callback.message,item,record[3])
     except Exception as exc:
         logging.error('Selection failed: %s',type(exc).__name__)
         await callback.message.answer('Не вдалося отримати карту. Надішли адресу ще раз.')
