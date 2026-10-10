@@ -102,6 +102,28 @@ def contains_point(ring, lat, lon):
     return inside
 
 
+def boundary_distance(point, element):
+    lat,lon=point['lat'],point['lon']
+    c=math.cos(math.radians(lat))
+    def xy(p): return ((p['lon']-lon)*111320*c,(p['lat']-lat)*111320)
+    distances=[]
+    for ring in shape(element):
+        for a,b in zip(ring,ring[1:]+ring[:1]):
+            ax,ay=xy(a); bx,by=xy(b); dx,dy=bx-ax,by-ay
+            den=dx*dx+dy*dy
+            u=max(0,min(1,-(ax*dx+ay*dy)/den)) if den else 0
+            distances.append(math.hypot(ax+u*dx,ay+u*dy))
+    return min(distances,default=float('inf'))
+
+
+def entrance_label(e):
+    tags=e.get('tags',{})
+    ref=tags.get('ref')
+    flats=tags.get('addr:flats')
+    title=('Під’їзд '+ref) if ref else 'Вхід'
+    return title+(' • кв. '+flats if flats else '')
+
+
 def associate(item, elements):
     typ, oid = item.get('osm_type'), item.get('osm_id')
     target = next((e for e in elements if e['type']==typ and e['id']==oid and e.get('tags',{}).get('building')), None)
@@ -126,7 +148,19 @@ def associate(item, elements):
             if member.get('type')=='way':
                 way=next((e for e in elements if e['type']=='way' and e['id']==member['ref']),None)
                 if way: ids.update(way.get('nodes', []))
-    entrances=[e for e in elements if e['type']=='node' and e['id'] in ids and e.get('tags',{}).get('entrance') not in (None,'no','exit','emergency')]
+    entrances=[]
+    buildings=[e for e in elements if e.get('tags',{}).get('building') and shape(e)]
+    for e in elements:
+        if e['type']!='node' or e.get('tags',{}).get('entrance') in (None,'no','exit','emergency'):
+            continue
+        if e['id'] in ids:
+            entrances.append(e)
+        elif target and boundary_distance(e,target)<=1.5:
+            # Some OSM entrances lie on a separate residential outline instead of
+            # sharing the building's nodes. Accept only an unambiguous close wall.
+            others=[w for w in buildings if w['id']!=target['id'] and boundary_distance(e,w)<=1.5]
+            if not others:
+                entrances.append(e)
     return elements,target,entrances
 
 
@@ -136,6 +170,10 @@ async def direct_building(item):
     if typ not in ('way','relation'):
         raise ValueError('Контур адресної точки не отримано')
     result=await fetch_json(f"https://www.openstreetmap.org/api/0.6/{typ}/{int(item['osm_id'])}/full.json",ttl=86400)
+    return unpack_osm(item,result)
+
+
+def unpack_osm(item,result):
     elements=result.get('elements',[])
     nodes={e['id']:e for e in elements if e['type']=='node'}
     ways={}
@@ -159,7 +197,8 @@ async def geometry(item):
     query=f"""[out:json][timeout:18];({selector}
 way(around:180,{lat},{lon})[building];
 relation(around:180,{lat},{lon})[building];
-way(around:180,{lat},{lon})[highway];);(._;>;);out body geom;"""
+way(around:180,{lat},{lon})[highway];
+node(around:180,{lat},{lon})[entrance];);(._;>;);out body geom;"""
     try:
         result=await fetch_json(OVERPASS,data={'data':query},ttl=86400)
         resolved=associate(item,result.get('elements',[]))
@@ -168,7 +207,19 @@ way(around:180,{lat},{lon})[highway];);(._;>;);out body geom;"""
     except (aiohttp.ClientError,asyncio.TimeoutError,ValueError) as exc:
         # Logs show status/type but do not include submitted addresses or tokens.
         logging.warning('Geometry provider failed: %s status=%s',type(exc).__name__,getattr(exc,'status','n/a'))
-    return await direct_building(item)
+    basic=await direct_building(item)
+    if basic[2]:
+        return basic
+    # Fetch a single small, requested viewport; cached, never scan the city.
+    try:
+        dlat=0.0014; dlon=0.0021
+        bbox=f'{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}'
+        result=await fetch_json('https://www.openstreetmap.org/api/0.6/map.json',params={'bbox':bbox},ttl=86400)
+        detailed=unpack_osm(item,result)
+        if detailed[1]: return detailed
+    except (aiohttp.ClientError,asyncio.TimeoutError,ValueError):
+        pass
+    return basic
 
 
 def shape(element):
@@ -230,7 +281,8 @@ def draw_map(item, elements, target, entrances, selected):
         ref=e.get('tags',{}).get('ref')
         color='#db2626' if selected and ref and ref.casefold()==selected.casefold() else '#1268c4'
         d.ellipse((x-9,y-9,x+9,y+9), fill=color, outline='white', width=2)
-        d.text((x+12,y-14), ref or '?', font=font, fill=color, stroke_width=2, stroke_fill='white')
+        label=(ref or '?') + (' • кв. '+e['tags']['addr:flats'] if e.get('tags',{}).get('addr:flats') else '')
+        d.text((x+12,y-22), label, font=small, fill=color, stroke_width=2, stroke_fill='white')
     d.rectangle((0,0,900,80), fill='white')
     d.text((20,15), 'Будинок і під’їзди • Івано-Франківськ', font=font, fill='#222222')
     d.text((20,45), 'Північ ↑  |  сині точки — входи; ? — номер відсутній', font=small, fill='#555555')
@@ -250,8 +302,8 @@ async def deliver(message, item, selected):
     matching = [e for e in entrances if selected and e.get('tags',{}).get('ref','').casefold()==selected.casefold()]
     point = matching[0] if len(matching)==1 else item
     lat,lon=float(point['lat']),float(point['lon'])
-    refs = [e.get('tags',{}).get('ref','без номера') for e in entrances]
-    info = 'Входи в OSM: ' + ', '.join(refs) if refs else 'Під’їзди для цього будинку не підтверджені в OSM.'
+    refs = [entrance_label(e) for e in entrances]
+    info = 'Входи в OSM:\n' + '\n'.join(refs) if refs else 'Під’їзди для цього будинку не підтверджені в OSM.'
     if selected:
         info += f'\nПід’їзд {selected}: ' + ('знайдено, геолокація входу.' if len(matching)==1 else 'не визначено однозначно; геолокація будинку.')
     text = f"📍 {item['display_name']}\n\n{lat:.7f}, {lon:.7f}\n{info}{warning}\n\n© OpenStreetMap contributors"
