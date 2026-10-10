@@ -1,0 +1,295 @@
+"""Personal courier address bot, Render webhook, Python 3.12+."""
+import asyncio
+import io
+import json
+import logging
+import math
+import os
+import re
+import secrets
+import sqlite3
+import time
+from pathlib import Path
+
+import aiohttp
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(__file__).parent
+NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
+OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass-api.de/api/interpreter')
+# Bounding box restricts searches to Ivano-Frankivsk and immediate surroundings.
+BOX = '24.62,49.00,24.80,48.85'
+lock = asyncio.Lock()
+last_request = 0.0
+session = None
+cache = None
+choices = {}
+allowed = {int(x) for x in os.getenv('ALLOWED_USER_IDS', '').split(',') if x.strip()}
+dp = Dispatcher()
+
+
+def parse_address(text):
+    text = text.strip().replace('’', "'").replace('ʼ', "'")
+    m = re.search(r"(?:під['’]?їзд|під[.]?|парадне)\s*№?\s*([\w-]+)", text, re.I)
+    entrance = m.group(1) if m else None
+    if m:
+        text = text[:m.start()] + text[m.end():]
+    text = re.sub(r'[,;\s]+$', '', text)
+    house = re.search(r'(\d+[а-яіїєґa-z]?(?:\s*[/\-]\s*\d+[а-яіїєґa-z]?)?)\s*$', text, re.I)
+    if not house:
+        raise ValueError('Напиши вулицю й номер будинку, наприклад: Мазепи 42, під’їзд 3. Корпус указуй як у адресі: 42А або 42/1.')
+    return text, entrance, house.group(1).replace(' ', '').casefold()
+
+
+def permitted(event):
+    return not allowed or event.from_user.id in allowed
+
+
+async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
+    global last_request
+    key = json.dumps([url, params, data], sort_keys=True, ensure_ascii=False)
+    row = cache.execute('SELECT body, expires FROM cache WHERE key=?', (key,)).fetchone()
+    if row and row[1] > time.time():
+        return json.loads(row[0])
+    async def request():
+        method = 'POST' if data is not None else 'GET'
+        async with session.request(method, url, params=params, data=data) as response:
+            response.raise_for_status()
+            body = await response.json()
+        if isinstance(body, dict) and body.get('remark'):
+            raise ValueError('Сервіс карти тимчасово перевантажений. Спробуй ще раз за хвилину.')
+        cache.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)', (key, json.dumps(body), time.time()+ttl))
+        cache.commit()
+        return body
+    if geocode:
+        async with lock:
+            await asyncio.sleep(max(0, 1.1 - (time.monotonic()-last_request)))
+            last_request = time.monotonic()
+            return await request()
+    return await request()
+
+
+async def search(text, house):
+    rows = await fetch_json(NOMINATIM + '/search', params={
+        'q': text + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
+        'addressdetails': 1, 'limit': 5, 'countrycodes': 'ua',
+        'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
+    # Never present a street centre or another house number as the requested house.
+    return [r for r in rows if r.get('address', {}).get('house_number', '').replace(' ', '').casefold() == house]
+
+
+async def geometry(item):
+    lat, lon = float(item['lat']), float(item['lon'])
+    selector = ''
+    typ = item.get('osm_type')
+    if typ in ('way', 'relation'):
+        selector = f"{typ}({int(item['osm_id'])});"
+    query = f'''[out:json][timeout:25];({selector}
+way(around:180,{lat},{lon})[building];
+way(around:180,{lat},{lon})[highway];
+node(around:180,{lat},{lon})[entrance];);out body geom;'''
+    result = await fetch_json(OVERPASS, data={'data': query}, ttl=86400)
+    elements = result.get('elements', [])
+    target = next((e for e in elements if e['type'] == typ and e['id'] == item.get('osm_id')), None)
+    # Associate entrances by shared outline nodes, never by nearest-distance guess.
+    ids = set(target.get('nodes', [])) if target else set()
+    if target and target['type'] == 'relation':
+        for member in target.get('members', []):
+            if member.get('type') == 'way':
+                way = next((e for e in elements if e['type']=='way' and e['id']==member['ref']), None)
+                if way:
+                    ids.update(way.get('nodes', []))
+    entrances = [e for e in elements if e['type']=='node' and e['id'] in ids and e.get('tags', {}).get('entrance') not in (None, 'no', 'exit', 'emergency')]
+    return elements, target, entrances
+
+
+def shape(element):
+    if not element:
+        return []
+    if element['type'] == 'relation':
+        return [m['geometry'] for m in element.get('members', []) if m.get('role') == 'outer' and m.get('geometry')]
+    return [element['geometry']] if element.get('geometry') else []
+
+
+def draw_map(item, elements, target, entrances, selected):
+    lat, lon = float(item['lat']), float(item['lon'])
+    rings = shape(target)
+    meters = [( (p['lon']-lon)*111320*math.cos(math.radians(lat)), (p['lat']-lat)*111320) for ring in rings for p in ring]
+    extent = max([abs(v) for p in meters for v in p] + [55]) + 35
+    scale = 700/(2*extent)
+    def xy(p):
+        return (450+(p['lon']-lon)*111320*math.cos(math.radians(lat))*scale,
+                470-(p['lat']-lat)*111320*scale)
+    img = Image.new('RGB', (900, 900), '#f3f1e9')
+    d = ImageDraw.Draw(img)
+    font = ImageFont.truetype(str(ROOT/'DejaVuSans.ttf'), 19)
+    small = ImageFont.truetype(str(ROOT/'DejaVuSans.ttf'), 15)
+    for e in elements:
+        if e.get('tags', {}).get('highway'):
+            for ring in shape(e):
+                pts = [xy(p) for p in ring]
+                if len(pts)>1:
+                    d.line(pts, fill='#ffffff', width=12)
+                    name = e.get('tags', {}).get('name')
+                    if name:
+                        p = pts[len(pts)//2]
+                        if 30<p[0]<760 and 100<p[1]<820:
+                            d.text(p, name, font=small, fill='#505050')
+    for e in elements:
+        if e.get('tags', {}).get('building'):
+            for ring in shape(e):
+                pts = [xy(p) for p in ring]
+                if len(pts)>2:
+                    d.polygon(pts, fill='#d6d1ca', outline='#9a948c')
+                    number = e.get('tags', {}).get('addr:housenumber')
+                    if number:
+                        mid = (sum(p[0] for p in pts)/len(pts), sum(p[1] for p in pts)/len(pts))
+                        d.text(mid, number, font=small, fill='#444444')
+    for ring in rings:
+        pts = [xy(p) for p in ring]
+        if len(pts)>2:
+            d.polygon(pts, fill='#ffd4b8', outline='#d35400', width=4)
+    if rings:
+        pts = [xy(p) for ring in rings for p in ring]
+        center = (sum(p[0] for p in pts)/len(pts), sum(p[1] for p in pts)/len(pts))
+        number = target.get('tags', {}).get('addr:housenumber') or item.get('address', {}).get('house_number', '')
+        d.text(center, number, font=font, fill='#713500')
+    if not rings:
+        x,y=xy({'lat':lat,'lon':lon})
+        d.ellipse((x-10,y-10,x+10,y+10), fill='#d35400')
+    for e in entrances:
+        x,y=xy(e)
+        ref=e.get('tags',{}).get('ref')
+        color='#db2626' if selected and ref and ref.casefold()==selected.casefold() else '#1268c4'
+        d.ellipse((x-9,y-9,x+9,y+9), fill=color, outline='white', width=2)
+        d.text((x+12,y-14), ref or '?', font=font, fill=color, stroke_width=2, stroke_fill='white')
+    d.rectangle((0,0,900,80), fill='white')
+    d.text((20,15), 'Будинок і під’їзди • Івано-Франківськ', font=font, fill='#222222')
+    d.text((20,45), 'Північ ↑  |  сині точки — входи; ? — номер відсутній', font=small, fill='#555555')
+    d.rectangle((0,840,900,900), fill='white')
+    d.text((18,850), 'Схема за даними OSM • © OpenStreetMap contributors', font=small, fill='#444444')
+    d.text((18,875), 'openstreetmap.org/copyright • не фото фасаду', font=small, fill='#444444')
+    out=io.BytesIO(); img.save(out, format='PNG'); return out.getvalue()
+
+
+async def deliver(message, item, selected):
+    warning = ''
+    try:
+        elements, target, entrances = await geometry(item)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        elements, target, entrances = [], None, []
+        warning = '\n⚠️ Дані контуру й під’їздів зараз недоступні. Показую адресну точку.'
+    matching = [e for e in entrances if selected and e.get('tags',{}).get('ref','').casefold()==selected.casefold()]
+    point = matching[0] if len(matching)==1 else item
+    lat,lon=float(point['lat']),float(point['lon'])
+    refs = [e.get('tags',{}).get('ref','без номера') for e in entrances]
+    info = 'Входи в OSM: ' + ', '.join(refs) if refs else 'Під’їзди для цього будинку не підтверджені в OSM.'
+    if selected:
+        info += f'\nПід’їзд {selected}: ' + ('знайдено, геолокація входу.' if len(matching)==1 else 'не визначено однозначно; геолокація будинку.')
+    text = f"📍 {item['display_name']}\n\n{lat:.7f}, {lon:.7f}\n{info}{warning}\n\n© OpenStreetMap contributors"
+    buttons=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='🗺 OpenStreetMap', url=f'https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=19/{lat}/{lon}'),
+        InlineKeyboardButton(text='🧭 Маршрут', url=f'https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=walking')]])
+    await message.answer(text, reply_markup=buttons)
+    await message.answer_location(latitude=lat, longitude=lon)
+    picture=await asyncio.to_thread(draw_map,item,elements,target,entrances,selected)
+    await message.answer_photo(BufferedInputFile(picture, filename='building.png'), caption='Схема будинку з даних OpenStreetMap. Номери під’їздів показані лише там, де внесені в карту.')
+
+
+@dp.message(CommandStart())
+async def start(message):
+    if not permitted(message):
+        return
+    await message.answer('Привіт! Напиши адресу в Івано-Франківську:\nМазепи 42\nабо Мазепи 42, під’їзд 3\n\nЯ надішлю координати, карту й позначені входи. Невідомі під’їзди не вгадую.\nТвій Telegram ID: '+str(message.from_user.id))
+
+
+@dp.message(F.text)
+async def address(message):
+    if not permitted(message):
+        return
+    try:
+        text, entrance, house = parse_address(message.text)
+        status = await message.answer('🔎 Шукаю будинок…')
+        rows = await search(text, house)
+        if not rows:
+            await status.edit_text('Точного будинку в OSM не знайдено. Перевір номер і назву вулиці; спробуй повну назву. Центр вулиці замість будинку не показую.')
+            return
+        if len(rows)==1:
+            await status.delete()
+            await deliver(message,rows[0],entrance)
+        else:
+            nonce=secrets.token_hex(6)
+            choices[nonce]=(message.from_user.id,time.time()+600,rows,entrance)
+            # Bound short-lived in-memory choices.
+            for k,v in list(choices.items()):
+                if v[1]<time.time(): choices.pop(k,None)
+            keyboard=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r['display_name'][:90],callback_data=f'pick:{nonce}:{i}')] for i,r in enumerate(rows)])
+            await status.edit_text('Знайшов кілька варіантів. Обери потрібний:',reply_markup=keyboard)
+    except ValueError as exc:
+        await message.answer(str(exc))
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        await message.answer('Сервіс карти зараз недоступний. Спробуй ще раз за хвилину.')
+    except Exception as exc:
+        logging.error('Address processing failed: %s', type(exc).__name__)
+        await message.answer('Не вдалося обробити адресу. Спробуй ще раз.')
+
+
+@dp.callback_query(F.data.startswith('pick:'))
+async def pick(callback):
+    if not permitted(callback):
+        await callback.answer(); return
+    _,nonce,index=callback.data.split(':')
+    record=choices.get(nonce)
+    if not record or record[0]!=callback.from_user.id or record[1]<time.time():
+        await callback.answer('Вибір застарів. Надішли адресу ще раз.',show_alert=True); return
+    await callback.answer('Готую карту…')
+    try:
+        await deliver(callback.message,record[2][int(index)],record[3])
+    except Exception as exc:
+        logging.error('Selection failed: %s',type(exc).__name__)
+        await callback.message.answer('Не вдалося отримати карту. Надішли адресу ще раз.')
+
+
+async def main():
+    global session, cache
+    token=os.environ['BOT_TOKEN']
+    base=os.getenv('WEBHOOK_URL') or os.getenv('RENDER_EXTERNAL_URL')
+    if not base or not base.startswith('https://'):
+        raise RuntimeError('Set WEBHOOK_URL to your HTTPS Render service URL')
+    secret=os.environ['WEBHOOK_SECRET']
+    if not re.fullmatch(r'[A-Za-z0-9_-]{24,256}',secret):
+        raise RuntimeError('WEBHOOK_SECRET must contain 24-256 letters, digits, underscores or hyphens')
+    contact=os.getenv('OSM_CONTACT',base)
+    data_dir=Path(os.getenv('DATA_DIR','./data')); data_dir.mkdir(parents=True,exist_ok=True)
+    cache=sqlite3.connect(data_dir/'cache.db')
+    cache.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, body TEXT, expires REAL)')
+    cache.execute('DELETE FROM cache WHERE expires < ?', (time.time(),)); cache.commit()
+    session=aiohttp.ClientSession(headers={'User-Agent':f'IFCourierMapBot/1.0 ({contact})'},timeout=aiohttp.ClientTimeout(total=40))
+    bot=Bot(token)
+    app=web.Application()
+    async def health(request): return web.Response(text='Courier bot OK')
+    app.router.add_get('/',health)
+    SimpleRequestHandler(dp,bot,secret_token=secret).register(app,path='/webhook')
+    setup_application(app,dp,bot=bot)
+    runner=web.AppRunner(app)
+    try:
+        await runner.setup()
+        await web.TCPSite(runner,'0.0.0.0',int(os.getenv('PORT','10000'))).start()
+        await bot.set_webhook(base.rstrip('/')+'/webhook',secret_token=secret,allowed_updates=dp.resolve_used_update_types())
+        logging.info('Courier bot started')
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+        await session.close()
+        await bot.session.close()
+        cache.close()
+
+
+if __name__=='__main__':
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
