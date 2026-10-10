@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
-OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass-api.de/api/interpreter')
+OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
 # Bounding box restricts searches to Ivano-Frankivsk and immediate surroundings.
 BOX = '24.62,49.00,24.80,48.85'
 lock = asyncio.Lock()
@@ -77,35 +77,98 @@ async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
 async def search(text, house):
     rows = await fetch_json(NOMINATIM + '/search', params={
         'q': text + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
-        'addressdetails': 1, 'limit': 5, 'countrycodes': 'ua',
+        'addressdetails': 1, 'limit': 10, 'countrycodes': 'ua',
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
     # Never present a street centre or another house number as the requested house.
-    return [r for r in rows if r.get('address', {}).get('house_number', '').replace(' ', '').casefold() == house]
+    exact = [r for r in rows if r.get('address', {}).get('house_number', '').replace(' ', '').casefold() == house]
+    buildings = [r for r in exact if r.get('category', r.get('class')) == 'building']
+    addresses = [r for r in exact if r.get('category', r.get('class')) in ('place', 'boundary') and r.get('type') in ('house', 'address', 'yes')]
+    candidates = buildings or addresses
+    if not candidates:
+        return []  # Do not substitute a shop/ATM for a residential building.
+    unique = {}
+    for r in candidates:
+        unique[(r.get('osm_type'), r.get('osm_id'))] = r
+    return list(unique.values())
+
+
+def contains_point(ring, lat, lon):
+    inside = False
+    for a, b in zip(ring, ring[1:] + ring[:1]):
+        if (a['lat'] > lat) != (b['lat'] > lat):
+            cross = (b['lon']-a['lon'])*(lat-a['lat'])/(b['lat']-a['lat']) + a['lon']
+            if lon < cross:
+                inside = not inside
+    return inside
+
+
+def associate(item, elements):
+    typ, oid = item.get('osm_type'), item.get('osm_id')
+    target = next((e for e in elements if e['type']==typ and e['id']==oid and e.get('tags',{}).get('building')), None)
+    if target is None:
+        number = item.get('address', {}).get('house_number', '').replace(' ', '').casefold()
+        street = item.get('address', {}).get('road', '').casefold()
+        candidates = []
+        for e in elements:
+            tags = e.get('tags', {})
+            if not tags.get('building') or not shape(e):
+                continue
+            # An address point inside a building establishes a geometric link.
+            contains = any(contains_point(ring,float(item['lat']),float(item['lon'])) for ring in shape(e))
+            address_match = bool(number and street and tags.get('addr:housenumber','').replace(' ','').casefold()==number and tags.get('addr:street','').casefold()==street)
+            if contains or address_match:
+                candidates.append(e)
+        if len(candidates)==1:
+            target=candidates[0]
+    ids = set(target.get('nodes', [])) if target else set()
+    if target and target['type']=='relation':
+        for member in target.get('members', []):
+            if member.get('type')=='way':
+                way=next((e for e in elements if e['type']=='way' and e['id']==member['ref']),None)
+                if way: ids.update(way.get('nodes', []))
+    entrances=[e for e in elements if e['type']=='node' and e['id'] in ids and e.get('tags',{}).get('entrance') not in (None,'no','exit','emergency')]
+    return elements,target,entrances
+
+
+async def direct_building(item):
+    # Read only the exact object and its constituent nodes, cached for one day.
+    typ=item.get('osm_type')
+    if typ not in ('way','relation'):
+        raise ValueError('Контур адресної точки не отримано')
+    result=await fetch_json(f"https://www.openstreetmap.org/api/0.6/{typ}/{int(item['osm_id'])}/full.json",ttl=86400)
+    elements=result.get('elements',[])
+    nodes={e['id']:e for e in elements if e['type']=='node'}
+    ways={}
+    for e in elements:
+        if e['type']=='way':
+            e['geometry']=[{'lat':nodes[n]['lat'],'lon':nodes[n]['lon']} for n in e.get('nodes',[]) if n in nodes]
+            ways[e['id']]=e
+    for e in elements:
+        if e['type']=='relation':
+            for member in e.get('members',[]):
+                if member.get('type')=='way' and member['ref'] in ways:
+                    member['geometry']=ways[member['ref']].get('geometry',[])
+    return associate(item,elements)
 
 
 async def geometry(item):
-    lat, lon = float(item['lat']), float(item['lon'])
-    selector = ''
-    typ = item.get('osm_type')
-    if typ in ('way', 'relation'):
-        selector = f"{typ}({int(item['osm_id'])});"
-    query = f'''[out:json][timeout:25];({selector}
+    lat,lon=float(item['lat']),float(item['lon'])
+    typ=item.get('osm_type')
+    selector=f"{typ}({int(item['osm_id'])});" if typ in ('way','relation') else ''
+    # Recurse to obtain all outline nodes, including entrances outside the viewport.
+    query=f"""[out:json][timeout:18];({selector}
 way(around:180,{lat},{lon})[building];
-way(around:180,{lat},{lon})[highway];
-node(around:180,{lat},{lon})[entrance];);out body geom;'''
-    result = await fetch_json(OVERPASS, data={'data': query}, ttl=86400)
-    elements = result.get('elements', [])
-    target = next((e for e in elements if e['type'] == typ and e['id'] == item.get('osm_id')), None)
-    # Associate entrances by shared outline nodes, never by nearest-distance guess.
-    ids = set(target.get('nodes', [])) if target else set()
-    if target and target['type'] == 'relation':
-        for member in target.get('members', []):
-            if member.get('type') == 'way':
-                way = next((e for e in elements if e['type']=='way' and e['id']==member['ref']), None)
-                if way:
-                    ids.update(way.get('nodes', []))
-    entrances = [e for e in elements if e['type']=='node' and e['id'] in ids and e.get('tags', {}).get('entrance') not in (None, 'no', 'exit', 'emergency')]
-    return elements, target, entrances
+relation(around:180,{lat},{lon})[building];
+way(around:180,{lat},{lon})[highway];);(._;>;);out body geom;"""
+    try:
+        result=await fetch_json(OVERPASS,data={'data':query},ttl=86400)
+        resolved=associate(item,result.get('elements',[]))
+        if resolved[1] is not None:
+            return resolved
+    except (aiohttp.ClientError,asyncio.TimeoutError,ValueError) as exc:
+        # Logs show status/type but do not include submitted addresses or tokens.
+        logging.warning('Geometry provider failed: %s status=%s',type(exc).__name__,getattr(exc,'status','n/a'))
+    return await direct_building(item)
 
 
 def shape(element):
@@ -197,6 +260,9 @@ async def deliver(message, item, selected):
         InlineKeyboardButton(text='🧭 Маршрут', url=f'https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=walking')]])
     await message.answer(text, reply_markup=buttons)
     await message.answer_location(latitude=lat, longitude=lon)
+    if not target or not shape(target):
+        await message.answer('Не вдалося завантажити контур будинку. Карту-зображення зараз не формую; відкрий OpenStreetMap за кнопкою вище.')
+        return
     picture=await asyncio.to_thread(draw_map,item,elements,target,entrances,selected)
     await message.answer_photo(BufferedInputFile(picture, filename='building.png'), caption='Схема будинку з даних OpenStreetMap. Номери під’їздів показані лише там, де внесені в карту.')
 
