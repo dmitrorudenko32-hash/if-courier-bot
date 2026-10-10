@@ -14,11 +14,12 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
+VERSION = '1.4-corpuses'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -33,6 +34,12 @@ allowed = {int(x) for x in os.getenv('ALLOWED_USER_IDS', '').split(',') if x.str
 dp = Dispatcher()
 
 
+def normalize_house(value):
+    value=value.casefold().strip()
+    value=re.sub(r'(?:корпус|корп\.?|к\.)\s*', 'к', value)
+    return re.sub(r'\s+', '', value)
+
+
 def parse_address(text):
     text = text.strip().replace('’', "'").replace('ʼ', "'")
     m = re.search(r"(?:під['’]?їзд|під[.]?|парадне)\s*№?\s*([\w-]+)", text, re.I)
@@ -40,10 +47,21 @@ def parse_address(text):
     if m:
         text = text[:m.start()] + text[m.end():]
     text = re.sub(r'[,;\s]+$', '', text)
-    house = re.search(r'(\d+[а-яіїєґa-z]?(?:\s*[/\-]\s*\d+[а-яіїєґa-z]?)?)\s*$', text, re.I)
+    # Corpus is separate from an entrance and from letter suffixes (18А).
+    corpus = re.search(r'(?:[,;\s]+)(?:корпус|корп\.?|к\.?)\s*№?\s*(\d+[а-яіїєґa-z]?)\s*$',text,re.I)
+    if not corpus:
+        corpus=re.search(r'(?<=\d)к\.?\s*(\d+[а-яіїєґa-z]?)\s*$',text,re.I)
+    unit=corpus.group(1) if corpus else None
+    if corpus:
+        text=text[:corpus.start()].rstrip(' ,;')
+    house=re.search(r'(\d+[а-яіїєґa-z]?(?:\s*[/\-]\s*\d+[а-яіїєґa-z]?)?)\s*$',text,re.I)
     if not house:
-        raise ValueError('Напиши вулицю й номер будинку, наприклад: Мазепи 42, під’їзд 3. Корпус указуй як у адресі: 42А або 42/1.')
-    return text, entrance, house.group(1).replace(' ', '').casefold()
+        raise ValueError('Напиши адресу: Височана 18, корпус 2, під’їзд 1. Також можна: Височана 18 к2 або Пулюя 15.')
+    number=house.group(1).replace(' ','')
+    if unit:
+        number+=' к'+unit
+        text=text[:house.start()]+number
+    return text,entrance,normalize_house(number)
 
 
 def permitted(event):
@@ -63,7 +81,7 @@ async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
             body = await response.json()
         if isinstance(body, dict) and body.get('remark'):
             raise ValueError('Сервіс карти тимчасово перевантажений. Спробуй ще раз за хвилину.')
-        cache.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)', (key, json.dumps(body), time.time()+ttl))
+        cache.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)', (key, json.dumps(body), time.time()+(300 if body == [] else ttl)))
         cache.commit()
         return body
     if geocode:
@@ -77,10 +95,12 @@ async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
 async def search(text, house):
     rows = await fetch_json(NOMINATIM + '/search', params={
         'q': text + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
-        'addressdetails': 1, 'limit': 10, 'countrycodes': 'ua',
+        'addressdetails': 1, 'limit': 8, 'countrycodes': 'ua',
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
     # Never present a street centre or another house number as the requested house.
-    exact = [r for r in rows if r.get('address', {}).get('house_number', '').replace(' ', '').casefold() == house]
+    exact = [r for r in rows if normalize_house(r.get('address', {}).get('house_number', '')) == house]
+    if not exact and 'к' not in house:
+        exact=[r for r in rows if normalize_house(r.get('address',{}).get('house_number','')).startswith(house+'к')]
     buildings = [r for r in exact if r.get('category', r.get('class')) == 'building']
     addresses = [r for r in exact if r.get('category', r.get('class')) in ('place', 'boundary') and r.get('type') in ('house', 'address', 'yes')]
     candidates = buildings or addresses
@@ -128,7 +148,7 @@ def associate(item, elements):
     typ, oid = item.get('osm_type'), item.get('osm_id')
     target = next((e for e in elements if e['type']==typ and e['id']==oid and e.get('tags',{}).get('building')), None)
     if target is None:
-        number = item.get('address', {}).get('house_number', '').replace(' ', '').casefold()
+        number = normalize_house(item.get('address', {}).get('house_number', ''))
         street = item.get('address', {}).get('road', '').casefold()
         candidates = []
         for e in elements:
@@ -137,7 +157,7 @@ def associate(item, elements):
                 continue
             # An address point inside a building establishes a geometric link.
             contains = any(contains_point(ring,float(item['lat']),float(item['lon'])) for ring in shape(e))
-            address_match = bool(number and street and tags.get('addr:housenumber','').replace(' ','').casefold()==number and tags.get('addr:street','').casefold()==street)
+            address_match = bool(number and street and normalize_house(tags.get('addr:housenumber',''))==number and tags.get('addr:street','').casefold()==street)
             if contains or address_match:
                 candidates.append(e)
         if len(candidates)==1:
@@ -306,7 +326,11 @@ async def deliver(message, item, selected):
     info = 'Входи в OSM:\n' + '\n'.join(refs) if refs else 'Під’їзди для цього будинку не підтверджені в OSM.'
     if selected:
         info += f'\nПід’їзд {selected}: ' + ('знайдено, геолокація входу.' if len(matching)==1 else 'не визначено однозначно; геолокація будинку.')
-    text = f"📍 {item['display_name']}\n\n{lat:.7f}, {lon:.7f}\n{info}{warning}\n\n© OpenStreetMap contributors"
+    house_label=item.get('address',{}).get('house_number','')
+    corpus_info=''
+    corpus_match=re.search(r'к(\d+[а-яіїєґa-z]?)$',normalize_house(house_label))
+    if corpus_match: corpus_info='\n🏢 Корпус '+corpus_match.group(1)
+    text = f"📍 {item['display_name']}{corpus_info}\n\n{lat:.7f}, {lon:.7f}\n{info}{warning}\n\n© OpenStreetMap contributors"
     buttons=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='🗺 OpenStreetMap', url=f'https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=19/{lat}/{lon}'),
         InlineKeyboardButton(text='🧭 Маршрут', url=f'https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=walking')]])
@@ -323,7 +347,13 @@ async def deliver(message, item, selected):
 async def start(message):
     if not permitted(message):
         return
-    await message.answer('Привіт! Напиши адресу в Івано-Франківську:\nМазепи 42\nабо Мазепи 42, під’їзд 3\n\nЯ надішлю координати, карту й позначені входи. Невідомі під’їзди не вгадую.\nТвій Telegram ID: '+str(message.from_user.id))
+    await message.answer('Версія '+VERSION+'\nПривіт! Напиши адресу в Івано-Франківську:\nМазепи 42\nМазепи 42, під’їзд 3\nВисочана 18, корпус 2\nВисочана 18 к2, під’їзд 1\n\nЯ надішлю координати, карту й позначені входи. Невідомі під’їзди не вгадую.\nТвій Telegram ID: '+str(message.from_user.id))
+
+
+@dp.message(Command('version'))
+async def version(message):
+    if permitted(message):
+        await message.answer('Версія '+VERSION)
 
 
 @dp.message(F.text)
@@ -335,7 +365,7 @@ async def address(message):
         status = await message.answer('🔎 Шукаю будинок…')
         rows = await search(text, house)
         if not rows:
-            await status.edit_text('Точного будинку в OSM не знайдено. Перевір номер і назву вулиці; спробуй повну назву. Центр вулиці замість будинку не показую.')
+            await status.edit_text(f'Точного будинку в OSM не знайдено. Запит: {text}.\nПеревір номер і назву вулиці.\nВерсія {VERSION}')
             return
         if len(rows)==1:
             await status.delete()
@@ -399,7 +429,7 @@ async def main():
         await runner.setup()
         await web.TCPSite(runner,'0.0.0.0',int(os.getenv('PORT','10000'))).start()
         await bot.set_webhook(base.rstrip('/')+'/webhook',secret_token=secret,allowed_updates=dp.resolve_used_update_types())
-        logging.info('Courier bot started')
+        logging.info('Courier bot started: %s', VERSION)
         await asyncio.Event().wait()
     finally:
         await runner.cleanup()
