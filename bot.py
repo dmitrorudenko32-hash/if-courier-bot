@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.5-personal'
+VERSION = '1.6-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -43,7 +43,7 @@ dp = Dispatcher()
 def normalize_house(value):
     value=value.casefold().strip()
     value=re.sub(r'(?:корпус|корп\.?|к\.)\s*', 'к', value)
-    return re.sub(r'\s+', '', value)
+    return re.sub(r'[\s,;]+', '', value)
 
 
 def parse_address(text):
@@ -101,7 +101,7 @@ async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
 async def search(text, house):
     rows = await fetch_json(NOMINATIM + '/search', params={
         'q': text + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
-        'addressdetails': 1, 'limit': 8, 'countrycodes': 'ua',
+        'addressdetails': 1, 'limit': 40, 'countrycodes': 'ua',
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
     # Never present a street centre or another house number as the requested house.
     exact = [r for r in rows if normalize_house(r.get('address', {}).get('house_number', '')) == house]
