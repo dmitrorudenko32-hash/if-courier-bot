@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.6-personal'
+VERSION = '1.7-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -109,13 +109,38 @@ async def search(text, house):
         exact=[r for r in rows if normalize_house(r.get('address',{}).get('house_number','')).startswith(house+'к')]
     buildings = [r for r in exact if r.get('category', r.get('class')) == 'building']
     addresses = [r for r in exact if r.get('category', r.get('class')) in ('place', 'boundary') and r.get('type') in ('house', 'address', 'yes')]
-    candidates = buildings or addresses
+    candidates = buildings or addresses or exact
+    if not buildings and not addresses:
+        for r in candidates:
+            r['_address_point'] = True
     if not candidates:
         return []  # Do not substitute a shop/ATM for a residential building.
     unique = {}
     for r in candidates:
         unique[(r.get('osm_type'), r.get('osm_id'))] = r
     return list(unique.values())
+
+
+async def search_complex(text):
+    name = re.sub(r'^(?:жк|житловий комплекс)\s*', '', text.strip(), flags=re.I)
+    key = re.sub(r'[^\w]+', '', name.casefold())
+    if key in ('familyplaza', 'феміліплаза', 'феміліплаза'):
+        return await search('Пелеша 3', '3')
+    if len(name) < 3:
+        raise ValueError('Напиши назву ЖК, наприклад: ЖК Family Plaza.')
+    rows = await fetch_json(NOMINATIM + '/search', params={
+        'q': name + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
+        'addressdetails': 1, 'limit': 40, 'countrycodes': 'ua',
+        'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
+    candidates = []
+    for r in rows:
+        category = r.get('category', r.get('class'))
+        if category in ('highway', 'boundary') or r.get('type') in ('city', 'town', 'village', 'suburb'):
+            continue
+        if not r.get('address', {}).get('house_number'):
+            r['_complex_point'] = True
+        candidates.append(r)
+    return candidates
 
 
 def contains_point(ring, lat, lon):
@@ -320,11 +345,15 @@ def draw_map(item, elements, target, entrances, selected):
 
 async def deliver(message, item, selected):
     warning = ''
+    if item.get('_address_point'):
+        warning = '\nℹ️ Це точна адресна позначка OSM; її тип: ' + str(item.get('type', 'невідомий')) + '.'
+    if item.get('_complex_point'):
+        warning = '\nℹ️ Це позначка комплексу в OSM. Номер будинку не вказаний; точку конкретного корпусу не підтверджено.'
     try:
         elements, target, entrances = await geometry(item)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         elements, target, entrances = [], None, []
-        warning = '\n⚠️ Дані контуру й під’їздів зараз недоступні. Показую адресну точку.'
+        warning += '\n⚠️ Дані контуру й під’їздів зараз недоступні. Показую адресну точку.'
     matching = [e for e in entrances if selected and e.get('tags',{}).get('ref','').casefold()==selected.casefold()]
     point = matching[0] if len(matching)==1 else item
     lat,lon=float(point['lat']),float(point['lon'])
@@ -561,17 +590,21 @@ async def address(message):
     if d:
         await process_draft(message,d);return
     try:
-        text, entrance, house = parse_address(message.text)
-        if DATABASE_URL:
+        is_complex = bool(re.match(r'^\s*(?:жк|житловий комплекс)\b', message.text, re.I)) or not bool(re.search(r'\d', message.text))
+        if is_complex:
+            text, entrance, house = message.text.strip(), None, None
+        else:
+            text, entrance, house = parse_address(message.text)
+        if DATABASE_URL and not is_complex:
             try:
                 personal=await db('find',message.from_user.id,text)
                 if personal and await deliver_personal(message,personal,entrance):return
             except ValueError as exc:
                 await message.answer(str(exc)+' Продовжую пошук у OSM.')
         status = await message.answer('🔎 Шукаю будинок…')
-        rows = await search(text, house)
+        rows = await search_complex(text) if is_complex else await search(text, house)
         if not rows:
-            await status.edit_text(f'Точного будинку в OSM не знайдено. Запит: {text}.\nПеревір номер і назву вулиці.\nВерсія {VERSION}')
+            await status.edit_text(f'В OSM не знайдено. Запит: {text}.\nПеревір назву ЖК або номер і назву вулиці.\nВерсія {VERSION}')
             return
         if len(rows)==1:
             await status.delete()
