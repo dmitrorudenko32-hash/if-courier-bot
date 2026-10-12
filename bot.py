@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.7-personal'
+VERSION = '1.9-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -43,7 +43,9 @@ dp = Dispatcher()
 def normalize_house(value):
     value=value.casefold().strip()
     value=re.sub(r'(?:корпус|корп\.?|к\.)\s*', 'к', value)
-    return re.sub(r'[\s,;]+', '', value)
+    value = re.sub(r'[\s,;]+', '', value)
+    # A hyphen before a letter is typography; retain numeric ranges and slashes.
+    return re.sub(r'(?<=\d)[\-–—](?=[а-яіїєґa-z](?:$|к\d))', '', value)
 
 
 def parse_address(text):
@@ -60,7 +62,7 @@ def parse_address(text):
     unit=corpus.group(1) if corpus else None
     if corpus:
         text=text[:corpus.start()].rstrip(' ,;')
-    house=re.search(r'(\d+[а-яіїєґa-z]?(?:\s*[/\-]\s*\d+[а-яіїєґa-z]?)?)\s*$',text,re.I)
+    house=re.search(r'(\d+(?:\s*[\-–—]?\s*[а-яіїєґa-z])?(?:\s*[/\-]\s*\d+(?:\s*[\-–—]?\s*[а-яіїєґa-z])?)?)\s*$',text,re.I)
     if not house:
         raise ValueError('Напиши адресу: Височана 18, корпус 2, під’їзд 1. Також можна: Височана 18 к2 або Пулюя 15.')
     number=house.group(1).replace(' ','')
@@ -74,7 +76,7 @@ def permitted(event):
     return not allowed or event.from_user.id in allowed
 
 
-async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
+async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False, timeout=12):
     global last_request
     key = json.dumps([url, params, data], sort_keys=True, ensure_ascii=False)
     row = cache.execute('SELECT body, expires FROM cache WHERE key=?', (key,)).fetchone()
@@ -82,7 +84,7 @@ async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False):
         return json.loads(row[0])
     async def request():
         method = 'POST' if data is not None else 'GET'
-        async with session.request(method, url, params=params, data=data) as response:
+        async with session.request(method, url, params=params, data=data, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
             response.raise_for_status()
             body = await response.json()
         if isinstance(body, dict) and body.get('remark'):
@@ -251,7 +253,7 @@ relation(around:180,{lat},{lon})[building];
 way(around:180,{lat},{lon})[highway];
 node(around:180,{lat},{lon})[entrance];);(._;>;);out body geom;"""
     try:
-        result=await fetch_json(OVERPASS,data={'data':query},ttl=86400)
+        result=await fetch_json(OVERPASS,data={'data':query},ttl=86400,timeout=6)
         resolved=associate(item,result.get('elements',[]))
         if resolved[1] is not None:
             return resolved
@@ -344,13 +346,19 @@ def draw_map(item, elements, target, entrances, selected):
 
 
 async def deliver(message, item, selected):
+    building_lat, building_lon = float(item['lat']), float(item['lon'])
+    await message.answer(
+        f"📍 Знайдено: {item['display_name']}\n{building_lat:.7f}, {building_lon:.7f}\nЗавантажую карту й перевіряю під’їзди…",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text='🗺 Відкрити знайдену точку',
+            url=f'https://www.openstreetmap.org/?mlat={building_lat}&mlon={building_lon}#map=19/{building_lat}/{building_lon}')]]))
     warning = ''
     if item.get('_address_point'):
         warning = '\nℹ️ Це точна адресна позначка OSM; її тип: ' + str(item.get('type', 'невідомий')) + '.'
     if item.get('_complex_point'):
         warning = '\nℹ️ Це позначка комплексу в OSM. Номер будинку не вказаний; точку конкретного корпусу не підтверджено.'
     try:
-        elements, target, entrances = await geometry(item)
+        elements, target, entrances = await asyncio.wait_for(geometry(item), timeout=22)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         elements, target, entrances = [], None, []
         warning += '\n⚠️ Дані контуру й під’їздів зараз недоступні. Показую адресну точку.'
