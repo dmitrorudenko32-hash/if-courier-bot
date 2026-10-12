@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.9-personal'
+VERSION = '1.10-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -107,8 +107,27 @@ async def search(text, house):
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
     # Never present a street centre or another house number as the requested house.
     exact = [r for r in rows if normalize_house(r.get('address', {}).get('house_number', '')) == house]
-    if not exact and 'к' not in house:
-        exact=[r for r in rows if normalize_house(r.get('address',{}).get('house_number','')).startswith(house+'к')]
+    if 'к' not in house:
+        exact += [r for r in rows if normalize_house(r.get('address',{}).get('house_number','')).startswith(house+'к')]
+        if exact:
+            base = exact[0]
+            lat, lon = float(base['lat']), float(base['lon'])
+            street = base.get('address', {}).get('road', '').casefold()
+            if street:
+                try:
+                    data = await fetch_json('https://www.openstreetmap.org/api/0.6/map.json', params={'bbox': f'{lon-.00525},{lat-.0035},{lon+.00525},{lat+.0035}'})
+                    nodes = {e['id']: e for e in data.get('elements', []) if e['type']=='node'}
+                    for e in data.get('elements', []):
+                        tags = e.get('tags', {})
+                        number = normalize_house(tags.get('addr:housenumber', ''))
+                        if not (e['type']=='way' and tags.get('building') and number.startswith(house+'к') and tags.get('addr:street', '').casefold()==street):
+                            continue
+                        points = [nodes[n] for n in e.get('nodes', []) if n in nodes]
+                        if not points or len(points)!=len(e.get('nodes', [])):
+                            continue
+                        exact.append({'osm_type':'way', 'osm_id':e['id'], 'category':'building', 'type':tags['building'], 'lat':str(sum(n['lat'] for n in points)/len(points)), 'lon':str(sum(n['lon'] for n in points)/len(points)), 'address':{'house_number':tags['addr:housenumber'], 'road':tags['addr:street']}, 'display_name':tags['addr:street']+' '+tags['addr:housenumber']+', Івано-Франківськ'})
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    pass
     buildings = [r for r in exact if r.get('category', r.get('class')) == 'building']
     addresses = [r for r in exact if r.get('category', r.get('class')) in ('place', 'boundary') and r.get('type') in ('house', 'address', 'yes')]
     candidates = buildings or addresses or exact
@@ -143,6 +162,29 @@ async def search_complex(text):
             r['_complex_point'] = True
         candidates.append(r)
     return candidates
+
+
+def parse_coordinates(text):
+    match = re.fullmatch(r'\s*([+-]?\d{1,3}\.\d+)\s*[,;\s]\s*([+-]?\d{1,3}\.\d+)\s*', text)
+    if not match:
+        return None
+    lat, lon = map(float, match.groups())
+    if not (48.85 <= lat <= 49.00 and 24.62 <= lon <= 24.80):
+        raise ValueError('Координати поза Івано-Франківськом. Порядок: широта, довгота — 48.932267, 24.702045.')
+    return lat, lon
+
+
+async def deliver_coordinates(message, lat, lon):
+    if not (48.85 <= lat <= 49.00 and 24.62 <= lon <= 24.80):
+        await message.answer('Точка поза Івано-Франківськом і найближчими околицями.');return
+    item = {'lat': str(lat), 'lon': str(lon), 'address': {}, 'display_name': 'Твоя точка за координатами'}
+    try:
+        result = await fetch_json(NOMINATIM + '/reverse', params={'lat': lat, 'lon': lon, 'format': 'jsonv2', 'addressdetails': 1, 'zoom': 18, 'accept-language': 'uk'}, geocode=True)
+        if result.get('display_name'):
+            item['display_name'] += '\nНайближча адреса / об’єкт OSM: ' + result['display_name']
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        item['display_name'] += '\nАдресу зараз визначити не вдалося.'
+    await deliver(message, item, None)
 
 
 def contains_point(ring, lat, lon):
@@ -232,7 +274,8 @@ def unpack_osm(item,result):
     ways={}
     for e in elements:
         if e['type']=='way':
-            e['geometry']=[{'lat':nodes[n]['lat'],'lon':nodes[n]['lon']} for n in e.get('nodes',[]) if n in nodes]
+            ids = e.get('nodes', [])
+            e['geometry']=[{'lat':nodes[n]['lat'],'lon':nodes[n]['lon']} for n in ids] if ids and all(n in nodes for n in ids) else []
             ways[e['id']]=e
     for e in elements:
         if e['type']=='relation':
@@ -261,15 +304,18 @@ node(around:180,{lat},{lon})[entrance];);(._;>;);out body geom;"""
         # Logs show status/type but do not include submitted addresses or tokens.
         logging.warning('Geometry provider failed: %s status=%s',type(exc).__name__,getattr(exc,'status','n/a'))
     basic=await direct_building(item)
-    if basic[2]:
-        return basic
     # Fetch a single small, requested viewport; cached, never scan the city.
     try:
         dlat=0.0014; dlon=0.0021
         bbox=f'{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}'
         result=await fetch_json('https://www.openstreetmap.org/api/0.6/map.json',params={'bbox':bbox},ttl=86400)
         detailed=unpack_osm(item,result)
-        if detailed[1]: return detailed
+        # Keep the complete exact outline even if the viewport omits some nodes.
+        by_id={(e['type'],e['id']):e for e in detailed[0]}
+        for e in basic[0]:
+            by_id[(e['type'],e['id'])]=e
+        merged=associate(item,list(by_id.values()))
+        if merged[1]: return merged
     except (aiohttp.ClientError,asyncio.TimeoutError,ValueError):
         pass
     return basic
@@ -466,8 +512,14 @@ async def add(message):
 async def saved_location(message):
     if not permitted(message):return
     d=draft_for(message)
-    if not d or d['stage']!='location':
-        await message.answer('Щоб зберегти точку, спочатку натисни «Додати під’їзд / корпус».');return
+    if not d:
+        try:
+            await deliver_coordinates(message, message.location.latitude, message.location.longitude)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await message.answer('Сервіс карти зараз недоступний. Спробуй ще раз.')
+        return
+    if d['stage']!='location':
+        await message.answer('Заверши поточний крок додавання або напиши /cancel.');return
     loc=message.location
     if loc.live_period:
         await message.answer('Надішли звичайну точку, а не трансляцію геопозиції.');return
@@ -598,6 +650,10 @@ async def address(message):
     if d:
         await process_draft(message,d);return
     try:
+        coords = parse_coordinates(message.text)
+        if coords:
+            await deliver_coordinates(message, *coords)
+            return
         is_complex = bool(re.match(r'^\s*(?:жк|житловий комплекс)\b', message.text, re.I)) or not bool(re.search(r'\d', message.text))
         if is_complex:
             text, entrance, house = message.text.strip(), None, None
