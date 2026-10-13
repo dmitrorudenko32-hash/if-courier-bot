@@ -22,13 +22,13 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.12-personal'
+VERSION = '1.14-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
 # Bounding box restricts searches to Ivano-Frankivsk and immediate surroundings.
 BOX = '24.58,49.05,24.88,48.80'
-VILLAGES = ('Крихівці', 'Драгомирчани', 'Хриплин', 'Микитинці', 'Угорники')
+VILLAGES = ('Крихівці', 'Драгомирчани', 'Хриплин', 'Микитинці', 'Угорники', 'Чукалівка')
 
 def locality_in(text):
     return next((v for v in VILLAGES if re.search(r'\b'+re.escape(v)+r'\b', text, re.I)), None)
@@ -117,6 +117,13 @@ async def search(text, house):
         'q': location_query(text), 'format': 'jsonv2',
         'addressdetails': 1, 'limit': 40, 'countrycodes': 'ua',
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
+    if 'к' in house and not any(normalize_house(r.get('address', {}).get('house_number', '')) == house for r in rows):
+        base_text = re.sub(r'(?<=[\dа-яіїєґa-z])\s*к\d+[а-яіїєґa-z]?(?=\s*(?:,|$))', '', text, flags=re.I)
+        if base_text != text:
+            rows = await fetch_json(NOMINATIM + '/search', params={
+                'q': location_query(base_text), 'format': 'jsonv2',
+                'addressdetails': 1, 'limit': 40, 'countrycodes': 'ua',
+                'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
     village = locality_in(text)
     if village:
         rows = [r for r in rows if village.casefold() in r.get('display_name', '').casefold()]
