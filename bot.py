@@ -22,12 +22,19 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.10-personal'
+VERSION = '1.11-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
 # Bounding box restricts searches to Ivano-Frankivsk and immediate surroundings.
-BOX = '24.62,49.00,24.80,48.85'
+BOX = '24.58,49.05,24.88,48.80'
+VILLAGES = ('Крихівці', 'Драгомирчани', 'Хриплин', 'Микитинці', 'Угорники')
+
+def locality_in(text):
+    return next((v for v in VILLAGES if re.search(r'\b'+re.escape(v)+r'\b', text, re.I)), None)
+
+def location_query(text):
+    return text + (', Івано-Франківська область, Україна' if locality_in(text) else ', Івано-Франківськ, Україна')
 lock = asyncio.Lock()
 last_request = 0.0
 session = None
@@ -50,6 +57,9 @@ def normalize_house(value):
 
 def parse_address(text):
     text = text.strip().replace('’', "'").replace('ʼ', "'")
+    village = locality_in(text)
+    if village:
+        text = re.sub(r'(?<!\w)(?:село\s+|с\.\s*)?' + re.escape(village) + r'\b', '', text, flags=re.I).strip(' ,;')
     m = re.search(r"(?:під['’]?їзд|під[.]?|парадне)\s*№?\s*([\w-]+)", text, re.I)
     entrance = m.group(1) if m else None
     if m:
@@ -69,6 +79,8 @@ def parse_address(text):
     if unit:
         number+=' к'+unit
         text=text[:house.start()]+number
+    if village:
+        text = text.strip(' ,;') + ', ' + village
     return text,entrance,normalize_house(number)
 
 
@@ -102,9 +114,12 @@ async def fetch_json(url, *, params=None, data=None, ttl=86400, geocode=False, t
 
 async def search(text, house):
     rows = await fetch_json(NOMINATIM + '/search', params={
-        'q': text + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
+        'q': location_query(text), 'format': 'jsonv2',
         'addressdetails': 1, 'limit': 40, 'countrycodes': 'ua',
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
+    village = locality_in(text)
+    if village:
+        rows = [r for r in rows if village.casefold() in r.get('display_name', '').casefold()]
     # Never present a street centre or another house number as the requested house.
     exact = [r for r in rows if normalize_house(r.get('address', {}).get('house_number', '')) == house]
     if 'к' not in house:
@@ -150,7 +165,7 @@ async def search_complex(text):
     if len(name) < 3:
         raise ValueError('Напиши назву ЖК, наприклад: ЖК Family Plaza.')
     rows = await fetch_json(NOMINATIM + '/search', params={
-        'q': name + ', Івано-Франківськ, Україна', 'format': 'jsonv2',
+        'q': location_query(name), 'format': 'jsonv2',
         'addressdetails': 1, 'limit': 40, 'countrycodes': 'ua',
         'viewbox': BOX, 'bounded': 1, 'accept-language': 'uk'}, geocode=True)
     candidates = []
@@ -169,14 +184,14 @@ def parse_coordinates(text):
     if not match:
         return None
     lat, lon = map(float, match.groups())
-    if not (48.85 <= lat <= 49.00 and 24.62 <= lon <= 24.80):
-        raise ValueError('Координати поза Івано-Франківськом. Порядок: широта, довгота — 48.932267, 24.702045.')
+    if not (48.80 <= lat <= 49.05 and 24.58 <= lon <= 24.88):
+        raise ValueError('Координати поза зоною Івано-Франківська та навколишніх сіл. Порядок: широта, довгота — 48.932267, 24.702045.')
     return lat, lon
 
 
 async def deliver_coordinates(message, lat, lon):
-    if not (48.85 <= lat <= 49.00 and 24.62 <= lon <= 24.80):
-        await message.answer('Точка поза Івано-Франківськом і найближчими околицями.');return
+    if not (48.80 <= lat <= 49.05 and 24.58 <= lon <= 24.88):
+        await message.answer('Точка поза зоною Івано-Франківська та навколишніх сіл і найближчими околицями.');return
     item = {'lat': str(lat), 'lon': str(lon), 'address': {}, 'display_name': 'Твоя точка за координатами'}
     try:
         result = await fetch_json(NOMINATIM + '/reverse', params={'lat': lat, 'lon': lon, 'format': 'jsonv2', 'addressdetails': 1, 'zoom': 18, 'accept-language': 'uk'}, geocode=True)
@@ -523,8 +538,8 @@ async def saved_location(message):
     loc=message.location
     if loc.live_period:
         await message.answer('Надішли звичайну точку, а не трансляцію геопозиції.');return
-    if not (48.85<=loc.latitude<=49.00 and 24.62<=loc.longitude<=24.80):
-        await message.answer('Точка поза Івано-Франківськом і найближчими околицями. Перевір її.');return
+    if not (48.80<=loc.latitude<=49.05 and 24.58<=loc.longitude<=24.88):
+        await message.answer('Точка поза зоною Івано-Франківська та навколишніх сіл і найближчими околицями. Перевір її.');return
     d.update(lat=loc.latitude,lon=loc.longitude,stage='flats')
     await message.answer('Напиши діапазон квартир, наприклад 1–37. Якщо він невідомий або додаєш корпус — надішли «-».')
 
