@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.14-personal'
+VERSION = '1.15-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -39,6 +39,7 @@ lock = asyncio.Lock()
 last_request = 0.0
 session = None
 cache = None
+VISICOM_API_KEY = os.getenv('VISICOM_API_KEY', '').strip()
 choices = {}
 drafts = {}
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -207,6 +208,81 @@ async def deliver_coordinates(message, lat, lon):
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         item['display_name'] += '\nАдресу зараз визначити не вдалося.'
     await deliver(message, item, None)
+
+
+def visicom_candidates(payload, text, house):
+    features = payload.get('features', []) if isinstance(payload, dict) else []
+    if isinstance(payload, dict) and payload.get('type') == 'Feature':
+        features = [payload]
+    results = []
+    locality = locality_in(text) or 'Івано-Франківськ'
+    seen = set()
+    for feature in features:
+        props = feature.get('properties', {})
+        if str(props.get('settlement', '')).casefold() != locality.casefold():
+            continue
+        name = str(props.get('name', ''))
+        number = normalize_house(name)
+        if number != house:
+            try:
+                number = parse_address(name)[2]
+            except ValueError:
+                continue
+        if number != house:
+            continue
+        centroid = feature.get('geo_centroid') or feature.get('geometry') or {}
+        coords = centroid.get('coordinates', []) if centroid.get('type') == 'Point' else []
+        if len(coords) < 2:
+            continue
+        try:
+            lon, lat = float(coords[0]), float(coords[1])
+        except (ValueError, TypeError):
+            continue
+        if not (48.80 <= lat <= 49.05 and 24.58 <= lon <= 24.88):
+            continue
+        identity = feature.get('id') or (lat, lon)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        label = ', '.join(str(x) for x in (props.get('settlement'), props.get('street_type'), props.get('street'), name) if x)
+        results.append({'display_name': label, 'lat': str(lat), 'lon': str(lon),
+                        '_visicom': True, '_copyright': props.get('copyright') or 'Картографічні дані © АТ «Візіком»'})
+    return results
+
+
+async def search_visicom(text, house):
+    if not VISICOM_API_KEY:
+        raise ValueError('Для пошуку Візіком додай VISICOM_API_KEY у Environment нового сервісу Render.')
+    params = {'text': location_query(text), 'categories': 'adr_address',
+              'country': 'ua', 'limit': 40, 'key': VISICOM_API_KEY,
+              'contains': 'POLYGON((24.58 48.80,24.88 48.80,24.88 49.05,24.58 49.05,24.58 48.80))'}
+    # No key or full request URL is stored in the cache or logged.
+    try:
+        async with session.get('https://api.visicom.ua/data-api/5.0/uk/geocode.json',
+                               params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status in (401, 403):
+                raise ValueError('Візіком відхилив доступ. Перевір API-ключ і його дозволи.')
+            if response.status == 429:
+                raise ValueError('Досягнуто ліміту запитів Візіком. Спробуй пізніше або перевір тариф.')
+            if response.status != 200:
+                raise ValueError('Пошук Візіком зараз недоступний. Спробуй пізніше.')
+            payload = await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise ValueError('Не вдалося з’єднатися з Візіком. Спробуй пізніше.') from None
+    return visicom_candidates(payload, text, house)
+
+
+async def deliver_visicom(message, item, entrance):
+    lat, lon = float(item['lat']), float(item['lon'])
+    info = '📍 Візіком: ' + item['display_name'] + f'\n\n{lat:.7f}, {lon:.7f}'
+    if entrance:
+        info += f'\nПід’їзд {entrance} не підтверджено: це координати адреси.'
+    info += '\n\n' + str(item['_copyright'])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='🗺 Точка в OpenStreetMap', url=f'https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=19/{lat}/{lon}'),
+        InlineKeyboardButton(text='🧭 Маршрут', url=f'https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=walking')]])
+    await message.answer(info, reply_markup=keyboard)
+    await message.answer_location(latitude=lat, longitude=lon)
 
 
 def contains_point(ring, lat, lon):
@@ -692,29 +768,42 @@ async def address(message):
     if d:
         await process_draft(message,d);return
     try:
-        coords = parse_coordinates(message.text)
+        prefix = re.match(r'^\s*(?:/visicom(?:@\w+)?|візіком|visicom)(?:\s+|$)', message.text, re.I)
+        use_visicom = bool(prefix)
+        request_text = message.text[prefix.end():].strip() if prefix else message.text
+        if use_visicom and not request_text:
+            raise ValueError('Напиши: /visicom Мазепи 42 або /visicom Драгомирчани, Яремчука 32.')
+        coords = parse_coordinates(request_text)
         if coords:
             await deliver_coordinates(message, *coords)
             return
-        is_complex = bool(re.match(r'^\s*(?:жк|житловий комплекс)\b', message.text, re.I)) or not bool(re.search(r'\d', message.text))
+        is_complex = bool(re.match(r'^\s*(?:жк|житловий комплекс)\b', request_text, re.I)) or not bool(re.search(r'\d', request_text))
         if is_complex:
-            text, entrance, house = message.text.strip(), None, None
+            text, entrance, house = request_text.strip(), None, None
         else:
-            text, entrance, house = parse_address(message.text)
-        if DATABASE_URL and not is_complex:
+            text, entrance, house = parse_address(request_text)
+        if DATABASE_URL and not is_complex and not use_visicom:
             try:
                 personal=await db('find',message.from_user.id,text)
                 if personal and await deliver_personal(message,personal,entrance):return
             except ValueError as exc:
                 await message.answer(str(exc)+' Продовжую пошук у OSM.')
         status = await message.answer('🔎 Шукаю будинок…')
-        rows = await search_complex(text) if is_complex else await search(text, house)
+        if use_visicom and is_complex:
+            raise ValueError('Пошук Візіком зараз підтримує адресу з номером будинку. Напиши: /visicom Мазепи 42.')
+        rows = await search_visicom(text, house) if use_visicom else (await search_complex(text) if is_complex else await search(text, house))
+        if not rows and not use_visicom and not is_complex and VISICOM_API_KEY:
+            await status.edit_text('В OSM не знайдено. Перевіряю Візіком…')
+            rows = await search_visicom(text, house)
         if not rows:
-            await status.edit_text(f'В OSM не знайдено. Запит: {text}.\nПеревір назву ЖК або номер і назву вулиці.\nВерсія {VERSION}')
+            await status.edit_text(f'Адресу не знайдено. Запит: {text}.\nПеревір назву ЖК або номер і назву вулиці.\nВерсія {VERSION}')
             return
         if len(rows)==1:
             await status.delete()
-            await deliver(message,rows[0],entrance)
+            if rows[0].get('_visicom'):
+                await deliver_visicom(message,rows[0],entrance)
+            else:
+                await deliver(message,rows[0],entrance)
         else:
             nonce=secrets.token_hex(6)
             choices[nonce]=(message.from_user.id,time.time()+600,rows,entrance)
@@ -743,7 +832,9 @@ async def pick(callback):
     await callback.answer('Готую карту…')
     try:
         item=record[2][int(index)]
-        if '_personal_row' in item:
+        if item.get('_visicom'):
+            await deliver_visicom(callback.message,item,record[3])
+        elif '_personal_row' in item:
             await deliver_personal(callback.message,[item['_personal_row']],item['_personal_row']['entrance'] or None)
         else:
             await deliver(callback.message,item,item.get('_requested_entrance') or record[3])
