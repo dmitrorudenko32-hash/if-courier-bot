@@ -22,7 +22,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '1.11-personal'
+VERSION = '1.12-personal'
 ROOT = Path(__file__).parent
 NOMINATIM = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org').rstrip('/')
 OVERPASS = os.getenv('OVERPASS_URL', 'https://overpass.private.coffee/api/interpreter')
@@ -438,6 +438,26 @@ async def deliver(message, item, selected):
     buttons=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='🗺 OpenStreetMap', url=f'https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=19/{lat}/{lon}'),
         InlineKeyboardButton(text='🧭 Маршрут', url=f'https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=walking')]])
+    if not selected:
+        numbered = {}
+        for entry in entrances:
+            ref = entry.get('tags', {}).get('ref')
+            if ref:
+                numbered.setdefault(str(ref), []).append(entry)
+        available = [(ref, group[0]) for ref, group in numbered.items() if len(group) == 1]
+        available.sort(key=lambda pair: (0, int(pair[0])) if pair[0].isdigit() else (1, pair[0]))
+        if available:
+            nonce = secrets.token_hex(6)
+            rows = [dict(item, _requested_entrance=ref) for ref, entry in available[:30]]
+            for key, record in list(choices.items()):
+                if record[1] < time.time():
+                    choices.pop(key, None)
+            choices[nonce] = (message.chat.id if message.chat.type == 'private' else message.from_user.id,
+                              time.time() + 600, rows, None)
+            for index, (ref, entry) in enumerate(available[:30]):
+                buttons.inline_keyboard.append([InlineKeyboardButton(
+                    text=entrance_label(entry)[:90], callback_data=f'pick:{nonce}:{index}')])
+            text += '\n\nОбери під’їзд кнопкою нижче.'
     await message.answer(text, reply_markup=buttons)
     await message.answer_location(latitude=lat, longitude=lon)
     if not target or not shape(target):
@@ -719,7 +739,7 @@ async def pick(callback):
         if '_personal_row' in item:
             await deliver_personal(callback.message,[item['_personal_row']],item['_personal_row']['entrance'] or None)
         else:
-            await deliver(callback.message,item,record[3])
+            await deliver(callback.message,item,item.get('_requested_entrance') or record[3])
     except Exception as exc:
         logging.error('Selection failed: %s',type(exc).__name__)
         await callback.message.answer('Не вдалося отримати карту. Надішли адресу ще раз.')
